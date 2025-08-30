@@ -1,0 +1,23 @@
+[project]
+name = "cot-monitoring"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ipykernel>=6.30.1",
+    "pandas>=2.3.2",
+    "torch>=2.8.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.66.0",
+    "regex>=2024.5.15",
+    "datasets>=2.20.0",
+    "transformers>=4.42.0",
+    "accelerate>=0.33.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.1.99",
+    "bitsandbytes>=0.43.0; platform_system == 'Linux'",
+    "huggingface-hub>=0.24.0",
+    "tyro>=0.8.5",
+    "matplotlib>=3.10.5",
+]

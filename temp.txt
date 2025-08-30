@@ -1,0 +1,473 @@
+import json
+import math
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+import time
+
+#!/usr/bin/env python3
+
+token = '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'
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.generation.utils import GenerationConfig
+import datasets
+from tqdm import tqdm
+import csv 
+
+# Check for TPU/GPU
+def get_device():
+    """Get the best available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return "mps"  # Apple Silicon
+    else:
+        return "cpu"
+
+PROMPT_TEMPLATE = (
+  """
+  You are a careful solver. Solve with explicit steps.
+
+  Format STRICTLY:
+  Step 1: ...
+  Step 2: ...
+  (add steps as needed)
+  Final Answer: <one token/number/string>
+
+  Do not write anything after the Final Answer line.
+
+  Problem: {QUESTION}
+  """.strip()
+)
+
+STEP_REGEX = re.compile(r"^Step\s+\d+:\s*", flags=re.MULTILINE)
+FINAL_REGEX = re.compile(r"Final Answer:\s*(.+)")
+
+def normalize_numeric_answer(text: str) -> str:
+    """Normalize numeric answers for comparison."""
+    t = text.strip()
+    # Strip trailing punctuation and commas
+    while t and t[-1] in ",.;:\n\t ":
+        t = t[:-1]
+    # Remove surrounding quotes
+    if (t.startswith("\"") and t.endswith("\"")) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1]
+    return t
+
+def extract_numeric_from_gsm8k_answer(ans: str) -> str:
+    """Extract numeric answer from GSM8K format."""
+    if "####" in ans:
+        num = ans.split("####")[-1].strip()
+        return normalize_numeric_answer(num)
+    return normalize_numeric_answer(ans)
+
+def numeric_equal(a: str, b: str) -> bool:
+    """Compare answers numerically or string-wise."""
+    def try_float(x: str) -> Optional[float]:
+        x = x.strip().replace(",", "")
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    fa, fb = try_float(a), try_float(b)
+    if fa is not None and fb is not None:
+        return math.isclose(fa, fb, rel_tol=1e-9, abs_tol=1e-9)
+    return a.strip().lower() == b.strip().lower()
+
+@dataclass
+class StepSpan:
+    step_idx: int
+    char_start: int
+    char_end: int
+    tok_start: int
+    tok_end: int
+    text: str
+
+def parse_steps_and_answer(text: str) -> Tuple[List[Tuple[int, int, str]], Optional[str]]:
+    """Parse CoT text into steps and final answer."""
+    print("TEXT REGEX", text) 
+    exit()
+    steps: List[Tuple[int, int, str]] = []  # (start, end, text)
+    matches = list(STEP_REGEX.finditer(text))
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chunk = text[start:end]
+        steps.append((start, end, chunk))
+    final_match = FINAL_REGEX.search(text)
+    final_ans = final_match.group(1).strip() if final_match else None
+    return steps, final_ans
+
+def align_token_spans(tokenizer, full_ids: List[int], text: str, step_spans_char: List[Tuple[int, int, str]]) -> List[StepSpan]:
+    """Align character spans to token spans."""
+    all_text = text
+    decoded = tokenizer.decode(full_ids, skip_special_tokens=True)
+    token_offsets: List[Tuple[int, int]] = []
+    pos = 0
+    for tid in full_ids:
+        piece = tokenizer.decode([tid], skip_special_tokens=True)
+        idx = decoded.find(piece, pos)
+        if idx == -1:
+            idx = pos
+        token_offsets.append((idx, idx + len(piece)))
+        pos = idx + len(piece)
+
+    result: List[StepSpan] = []
+    for s_idx, (cs, ce, s_text) in enumerate(step_spans_char, start=1):
+        tok_start = 0
+        tok_end = len(token_offsets)
+        for i, (ts, te) in enumerate(token_offsets):
+            if ts <= cs < te or cs <= ts:
+                tok_start = i
+                break
+        for j in range(len(token_offsets) - 1, -1, -1):
+            ts, te = token_offsets[j]
+            if ts < ce <= te or te <= ce:
+                tok_end = j + 1
+                break
+        result.append(StepSpan(step_idx=s_idx, char_start=cs, char_end=ce, tok_start=tok_start, tok_end=tok_end, text=s_text))
+    return result
+
+def load_gsm8k_problems(n_samples: int = 40, seed: int = 123) -> List[Dict[str, Any]]:
+    """Load and sample GSM8K problems."""
+    import random
+    random.seed(seed)
+
+    print("Loading GSM8K dataset...")
+    ds = datasets.load_dataset("gsm8k", "main", split="train")
+    items: List[Dict[str, Any]] = []
+
+    for ex in tqdm(ds, desc="Processing GSM8K"):
+        question = ex.get("question", "").strip()
+        answer = ex.get("answer", "").strip()
+        gold = extract_numeric_from_gsm8k_answer(answer)
+        if question and gold and any(ch.isdigit() for ch in gold):
+            items.append({
+                "id": ex.get("id", f"gsm8k-train-{len(items)}"),
+                "problem": question,
+                "gold_answer": gold,
+                "source": "gsm8k/main",
+            })
+
+    random.shuffle(items)
+    selected = items[:n_samples]
+    print(f"Selected {len(selected)} problems")
+    return selected
+
+def load_model(model_name: str, device: str):
+    """Load model with appropriate settings for device."""
+    print(f"Loading model: {model_name}")
+    print(f"Device: {device}")
+
+    kwargs = {}
+    if device == "cuda":
+        kwargs.update(dict(torch_dtype=torch.float16))
+    elif device == "mps":
+        kwargs.update(dict(torch_dtype=torch.float32))
+    else:
+        kwargs.update(dict(torch_dtype=torch.float32))
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, token=token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto" if device == "cuda" else None,
+        token=token,
+        **kwargs
+    )
+
+    if device in ["cpu", "mps"]:
+        model.to(device)
+
+    model.eval()
+    return model, tokenizer
+
+def mine_for_problem(model, tokenizer, problem: Dict[str, Any], out_runs,
+                    attempt_schedule: List[Tuple[float, int]], top_p: float,
+                    max_new_tokens: int, model_name: str, device: str) -> Optional[Dict[str, Any]]:
+    """Mine for correct/incorrect pairs for a single problem."""
+    question = problem["problem"].strip()
+    gold = str(problem["gold_answer"]).strip()
+    prompt = PROMPT_TEMPLATE.format(QUESTION=question)
+
+    correct_ref = None
+    incorrect_ref = None
+    attempts_done = 0
+
+    for temperature, num_attempts in attempt_schedule:
+        for k in range(num_attempts):
+            if correct_ref and incorrect_ref:
+                break
+
+            attempt_index = attempts_done
+            seed = abs(hash((problem["id"], attempt_index))) % (2**31)
+
+            inputs = tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            do_sample = (temperature > 0.0)
+
+            if do_sample:
+                gen_config = GenerationConfig(
+                    do_sample=True,
+                    temperature=max(temperature, 1e-8),  # or just temperature
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            else:
+                gen_config = GenerationConfig(
+                    do_sample=False,
+                    # optionally: num_beams=4,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            with torch.no_grad():
+                gen_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=gen_config,
+                    use_cache=True,
+                )
+
+            full_ids = gen_ids[0].tolist()
+            full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+
+            if full_text.startswith(prompt):
+                cot_text = full_text[len(prompt):]
+            else:
+                cot_text = full_text
+
+            steps_char, final_answer = parse_steps_and_answer(cot_text)
+            parse_ok = len(steps_char) > 0 and final_answer is not None
+            is_correct = False
+            if parse_ok:
+                is_correct = numeric_equal(final_answer, gold)
+
+            step_spans: List[StepSpan] = []
+            try:
+                step_spans = align_token_spans(tokenizer, full_ids, full_text, steps_char)
+            except Exception:
+                step_spans = []
+
+            record = {
+                "id": problem["id"],
+                "attempt": attempt_index,
+                "temperature": float(temperature),
+                "top_p": top_p,
+                "seed": seed,
+                "model": model_name,
+                "prompt": prompt,
+                "text": cot_text,
+                "final_answer": final_answer if final_answer is not None else "",
+                "correct": bool(is_correct and parse_ok),
+                "parse_ok": bool(parse_ok),
+                "token_ids": full_ids,
+                "step_spans": [s.__dict__ for s in step_spans],
+                "final_answer_span": {"tok_start": -1, "tok_end": -1},
+            }
+
+            runs_path = Path("MATS2025_WINTER_RESULTS") / "runs.jsonl"
+
+            # inside your loop, after creating `record`
+            with runs_path.open("a", encoding="utf-8") as f:   # "a" = append mode
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                print('SAVED RECORD')
+
+            if record["correct"] and correct_ref is None:
+                correct_ref = {"attempt": attempt_index}
+            if (not record["correct"]) and incorrect_ref is None:
+                incorrect_ref = {"attempt": attempt_index}
+
+            attempts_done += 1
+            if attempts_done >= 8:
+                break
+            exit()
+
+    if correct_ref and incorrect_ref:
+        correct_attempt = correct_ref["attempt"]
+        correct_runs = [r for r in out_runs if r["id"] == problem["id"] and r["attempt"] == correct_attempt]
+        if not correct_runs:
+            return None
+        ctext = correct_runs[0]["text"]
+        steps_char, _ = parse_steps_and_answer(ctext)
+        early_idx = 1 if len(steps_char) >= 1 else -1
+        late_idx = len(steps_char) if len(steps_char) >= 1 else -1
+        return {
+            "id": problem["id"],
+            "problem": question,
+            "gold_answer": gold,
+            "correct_ref": {"attempt": correct_attempt},
+            "incorrect_ref": {"attempt": incorrect_ref["attempt"]},
+            "steps_selected": {
+                "early": {"from": "correct", "step_idx": early_idx},
+                "late": {"from": "correct", "step_idx": late_idx},
+            },
+            "decode_config": {"top_p": top_p, "max_new_tokens": max_new_tokens},
+        }
+    return None
+
+"""Main mining function."""
+# Configuration
+n_problems = 40
+min_pairs = 20
+max_tries = 8
+top_p = 0.95
+max_new_tokens = 1024
+temperature_seq = "0.0,0.9,1.0,0.7,0.5"
+
+# Model fallback chain
+try_models = [
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "Qwen/Qwen2.5-3B-Instruct",
+    "microsoft/DialoGPT-medium",  # Smaller fallback
+    "gpt2"  # Smallest fallback
+]
+
+print("=== CoT Pair Mining for Colab ===")
+print(f"Target: {min_pairs} pairs from {n_problems} problems")
+
+# Get device
+device = get_device()
+print(f"Using device: {device}")
+
+# Load problems
+problems = load_gsm8k_problems(n_samples=n_problems, seed=123)
+
+# Try models
+model = None
+tokenizer = None
+chosen_model_name = None
+
+for model_name in try_models:
+    try:
+        print(f"\nTrying model: {model_name}")
+        model, tokenizer = load_model(model_name, device)
+        chosen_model_name = model_name
+        print(f"Successfully loaded: {model_name}")
+        break
+    except Exception as e:
+        print(f"Failed to load {model_name}: {e}")
+        continue
+
+if model is None:
+    raise RuntimeError("Failed to load any model")
+
+
+# Build generation schedule
+temps = [float(t.strip()) for t in temperature_seq.split(",") if t.strip()]
+schedule: List[Tuple[float, int]] = []
+for t in temps:
+    if abs(t - 0.0) < 1e-8:
+        schedule.append((t, 1))
+    else:
+        schedule.append((t, 2))
+
+print(f"Generation schedule: {schedule}")
+schedule = schedule[:2]
+# Mine pairs
+runs_records: List[Dict[str, Any]] = []
+pairs_records: List[Dict[str, Any]] = []
+
+print(f"\nStarting mining with {len(problems)} problems...")
+start_time = time.time()
+
+from pathlib import Path
+import json
+from tqdm import tqdm
+
+# --- Paths ---
+results_dir = Path("MATS2025_WINTER_RESULTS")
+results_dir.mkdir(parents=True, exist_ok=True)
+
+runs_path = results_dir / "runs.jsonl"                 # all generation attempts (one JSON per line)
+pairs_path = results_dir / "pairs.jsonl"               # successful pairs (one JSON per line)
+pairs_summary_path = results_dir / "pairs_summary.jsonl"  # compact per-pair summary (one JSON per line)
+progress_path = results_dir / "summary.json"           # small aggregate progress file (overwritten each pair)
+
+# pairs_records, runs_records, problems, min_pairs, schedule, top_p, max_new_tokens,
+# chosen_model_name, device, model, tokenizer are assumed to exist.
+
+for i, prob in enumerate(tqdm(problems, desc="Mining problems")):
+    if len(pairs_records) >= min_pairs:
+        break
+
+    pair = mine_for_problem(
+        model=model,
+        tokenizer=tokenizer,
+        problem=prob,
+        out_runs=runs_records,
+        attempt_schedule=schedule,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        model_name=chosen_model_name,
+        device=device,
+    )
+
+    if pair is None:
+        continue
+
+    pairs_records.append(pair)
+    print(f"Found pair {len(pairs_records)}/{min_pairs} for problem {prob['id']}")
+
+    # --- Append ONLY the runs for this problem to runs.jsonl ---
+    new_runs = [r for r in runs_records if r["id"] == prob["id"]]
+    with runs_path.open("a", encoding="utf-8") as f:
+        for r in new_runs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    # --- Append the pair to pairs.jsonl ---
+    with pairs_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+
+    # --- Append a compact summary record to pairs_summary.jsonl ---
+    correct_attempt = pair["correct_ref"]["attempt"]
+    incorrect_attempt = pair["incorrect_ref"]["attempt"]
+    early_idx = pair["steps_selected"]["early"]["step_idx"]
+    late_idx = pair["steps_selected"]["late"]["step_idx"]
+    n_attempts = max(r["attempt"] for r in runs_records if r["id"] == pair["id"]) + 1
+
+    summary_rec = {
+        "id": pair["id"],
+        "n_attempts": n_attempts,
+        "early_step_idx": early_idx,
+        "late_step_idx": late_idx,
+        "correct_attempt": correct_attempt,
+        "incorrect_attempt": incorrect_attempt,
+    }
+    with pairs_summary_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary_rec, ensure_ascii=False) + "\n")
+
+    # --- Update a tiny aggregate progress file (JSON, overwritten each time) ---
+    progress = {
+        "pairs_found": len(pairs_records),
+        "problems_processed": i + 1,
+        "last_problem_id": prob["id"],
+    }
+    with progress_path.open("w", encoding="utf-8") as f:
+        json.dump(progress, f, indent=2, ensure_ascii=False)
+
+import pandas as pd
+
+# Basic reading
+df = pd.read_json('file.jsonl', lines=True)
+
+# With additional options
+df = pd.read_json('file.jsonl', 
+                  lines=True,
+                  orient='records',  # Each line is a record
+                  dtype_backend='numpy_nullable')  # For better null handling

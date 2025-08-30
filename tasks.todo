@@ -1,0 +1,7 @@
+- Create graphs for simple ablation step
+- Collect data for causal chain relation step 
+- Collect some examples of the data in action 
+
+- What else can I analyze per step? 
+-- One more metric then make the report 
+    -- check to see which steps are necessary for the final outcome by zeroing out all other steps , or finding the minimum step limit to guess the final outcome? <-- after this we are finito 
